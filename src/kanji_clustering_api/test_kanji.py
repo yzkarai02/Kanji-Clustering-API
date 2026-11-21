@@ -12,13 +12,27 @@ import pandas as pd
 import pytest
 
 from .affinities_detection import get_affinities
-from .clustering import kanji_group, store_estimator
-from .estimator_store import EstimatorIntegrityError, load_estimator
+from .clustering import (
+    create_fitted_estimator,
+    extract_feature,
+    kanji_group,
+    store_estimator,
+)
+from .estimator_store import (
+    EstimatorIntegrityError,
+    load_estimator,
+    store_estimator_file,
+)
 from .main import affinities, app
+from .preprocessing import ndarray_of
 
 # Constants for expected values
 JIS_LEVEL_1_COUNT = 2965
+JIS_LEVEL_2_COUNT = 3390
 EXPECTED_AFFINITY_COUNT = 3
+IMAGE_SHAPE = (64, 64, 3)
+SMALL_GROUP_SIZE = 4
+PAIR_COUNT = 2
 
 
 def test_kanji_jis_daiichisuijun() -> None:
@@ -146,6 +160,133 @@ def test_load_estimator_rejects_tampered_file(
     (estimator_dir / "unpinned.pkl").write_bytes(good)
     with pytest.raises(EstimatorIntegrityError):
         load_estimator("unpinned")
+
+
+def test_kanji_jis_dainisuijun() -> None:
+    """Test that JIS Level 2 kanji group has the expected number of characters."""
+    result_length = len(kanji_group("jis_level_2"))
+    if result_length != JIS_LEVEL_2_COUNT:
+        msg = f"Expected {JIS_LEVEL_2_COUNT} characters, got {result_length}"
+        raise AssertionError(msg)
+
+
+def test_ndarray_of_renders_character() -> None:
+    """A character renders deterministically to a 64x64 RGB array."""
+    result = ndarray_of("あ")
+
+    assert result.shape == IMAGE_SHAPE  # noqa: S101
+    assert result.dtype == np.uint8  # noqa: S101
+    assert int(result.sum()) > 0  # noqa: S101
+    assert np.array_equal(result, ndarray_of("あ"))  # noqa: S101
+    assert not np.array_equal(result, ndarray_of("い"))  # noqa: S101
+
+
+@patch("kanji_clustering_api.clustering.ndarray_of")
+@patch("kanji_clustering_api.clustering.kanji_group")
+def test_extract_feature_flattens_each_character(
+    mock_kanji_group: MagicMock,
+    mock_ndarray_of: MagicMock,
+) -> None:
+    """Each character's image is flattened into one feature row."""
+    mock_kanji_group.return_value = ["あ", "い"]
+    mock_ndarray_of.side_effect = [np.ones((2, 2)), np.zeros((2, 2))]
+
+    result = extract_feature("jis_level_1")
+
+    assert result.shape == (2, SMALL_GROUP_SIZE)  # noqa: S101
+    assert np.array_equal(result[0], np.ones(SMALL_GROUP_SIZE))  # noqa: S101
+    assert np.array_equal(result[1], np.zeros(SMALL_GROUP_SIZE))  # noqa: S101
+
+
+@patch("kanji_clustering_api.clustering.kanji_group")
+@patch("kanji_clustering_api.clustering.extract_feature")
+def test_create_fitted_estimator(
+    mock_extract_feature: MagicMock,
+    mock_kanji_group: MagicMock,
+) -> None:
+    """Fitting returns a labelled estimator and a character/label frame."""
+    characters = ["あ", "い", "う", "え"]
+    mock_kanji_group.return_value = characters
+    mock_extract_feature.return_value = np.array(
+        [[0.0, 0.0], [0.0, 1.0], [10.0, 10.0], [10.0, 11.0]],
+    )
+
+    estimator, df = create_fitted_estimator("jis_level_1", n_clusters=2)
+
+    assert list(df.columns) == ["character", "label"]  # noqa: S101
+    assert df["character"].tolist() == characters  # noqa: S101
+    assert len(estimator.labels_) == SMALL_GROUP_SIZE  # noqa: S101
+    assert set(estimator.labels_.tolist()) == {0, 1}  # noqa: S101
+    # Well-separated pairs must land in different clusters from each other.
+    assert df["label"].iloc[0] == df["label"].iloc[1]  # noqa: S101
+    assert df["label"].iloc[2] == df["label"].iloc[3]  # noqa: S101
+    assert df["label"].iloc[0] != df["label"].iloc[2]  # noqa: S101
+
+
+def test_store_estimator_file_roundtrip_and_manifest_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stored objects load back, and the manifest tracks every file."""
+    estimator_dir = tmp_path / "estimator"
+    estimator_dir.mkdir()
+    manifest_path = estimator_dir / "SHA256SUMS"
+    monkeypatch.setattr(
+        "kanji_clustering_api.estimator_store.ESTIMATOR_DIR",
+        estimator_dir,
+    )
+    monkeypatch.setattr(
+        "kanji_clustering_api.estimator_store.MANIFEST_PATH",
+        manifest_path,
+    )
+
+    # First store: no manifest exists yet, so one is created from scratch.
+    store_estimator_file("alpha", ("estimator", "df"))
+    assert load_estimator("alpha") == ("estimator", "df")  # noqa: S101
+    digest = hashlib.sha256((estimator_dir / "alpha.pkl").read_bytes()).hexdigest()
+    assert manifest_path.read_text(encoding="utf-8") == f"{digest}  alpha.pkl\n"  # noqa: S101
+
+    # A blank line in the manifest must be ignored when it is re-read, and
+    # storing a second set must keep the existing entry, sorted by name.
+    with manifest_path.open("a", encoding="utf-8") as manifest:
+        manifest.write("\n")
+    store_estimator_file("beta", ("other", "df"))
+    assert load_estimator("beta") == ("other", "df")  # noqa: S101
+    names = [
+        line.split(maxsplit=1)[1]
+        for line in manifest_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert names == ["alpha.pkl", "beta.pkl"]  # noqa: S101
+
+    # Overwriting a set replaces its entry instead of duplicating it.
+    store_estimator_file("alpha", ("new", "df"))
+    assert load_estimator("alpha") == ("new", "df")  # noqa: S101
+    assert len(manifest_path.read_text(encoding="utf-8").splitlines()) == PAIR_COUNT  # noqa: S101
+
+
+@patch("kanji_clustering_api.main.get_affinities")
+def test_affinities_endpoint_combines_valid_sets_and_skips_invalid(
+    mock_get_affinities: MagicMock,
+) -> None:
+    """Valid sets are combined in order; unknown set names are ignored."""
+    mock_get_affinities.side_effect = [np.array(["蟻"]), np.array(["蛛"])]
+
+    result = affinities(character="蟻", sets="jis_level_1 unknown jis_level_2")
+
+    assert result == {"character": "蟻", "affinities": ["蟻", "蛛"]}  # noqa: S101
+    assert mock_get_affinities.call_count == PAIR_COUNT  # noqa: S101
+
+
+@patch("kanji_clustering_api.main.get_affinities")
+def test_affinities_endpoint_with_no_valid_sets(
+    mock_get_affinities: MagicMock,
+) -> None:
+    """A request naming no valid set returns an empty affinity list."""
+    result = affinities(character="蟻", sets="unknown")
+
+    assert result == {"character": "蟻", "affinities": []}  # noqa: S101
+    mock_get_affinities.assert_not_called()
 
 
 def test_affinities_character_limited_to_one_code_point() -> None:
