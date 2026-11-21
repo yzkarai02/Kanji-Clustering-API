@@ -79,8 +79,13 @@ jobs:
     - name: Install dependencies
       run: uv sync --group dev
       
+    # Do NOT wrap this in `coverage run`: pyproject.toml's pytest addopts
+    # already enable pytest-cov (--cov), and the nested coverage session
+    # discards the collected data, leaving the reports generated below
+    # (and the XML uploaded to Codecov) at 0% regardless of the real
+    # coverage shown in this step's own output.
     - name: Run pytest
-      run: uv run coverage run -m pytest
+      run: uv run pytest
     - name: Generate coverage reports
       if: always()
       run: |
