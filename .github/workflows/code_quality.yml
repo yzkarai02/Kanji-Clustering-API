@@ -103,5 +103,5 @@ jobs:
         files: coverage/coverage.xml
         disable_search: true
         disable_telem: true
-        use_oidc: true
+        token: ${{ secrets.CODECOV_TOKEN }}
         fail_ci_if_error: true
